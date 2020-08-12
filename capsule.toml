@@ -1,0 +1,5 @@
+deployment = "deployment.toml"
+
+[[contracts]]
+name = "bitcoin-spv-lib"
+template_type = "Rust"
