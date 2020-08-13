@@ -9,21 +9,28 @@ use core::result::Result;
 
 // Import heap related library from `alloc`
 // https://doc.rust-lang.org/alloc/index.html
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 // Import CKB syscalls and structures
 // https://nervosnetwork.github.io/ckb-std/riscv64imac-unknown-none-elf/doc/ckb_std/index.html
+use bitcoin_spv::{
+    btcspv,
+    types::{HeaderArray, MerkleArray, SPVError, Vin, Vout},
+    validatespv,
+};
 use ckb_std::{
     ckb_constants::Source,
-    entry,
-    default_alloc,
-    debug,
-    high_level::{load_script, load_tx_hash, load_cell_data_hash, load_cell_data, load_witness_args},
-    error::SysError,
     ckb_types::{bytes::Bytes, prelude::*},
+    debug, default_alloc, entry,
+    error::SysError,
+    high_level::{load_cell_data, load_witness_args},
 };
 use num::bigint::BigUint;
-use bitcoin_spv::types::{RawHeader, Hash256Digest, HeaderArray};
+
+mod types;
+use types::{Difficulty, DifficultyReader, SPVProof, SPVProofReader};
+
+const TX_PROOF_DIFFICULTY_FACTOR: u8 = 6;
 
 pub type RawBytes = Vec<u8>;
 
@@ -47,6 +54,16 @@ enum Error {
     LengthNotEnough,
     Encoding,
     // Add customized errors here...
+    WitnessInvalidEncoding,
+    WitnessMissInputType,
+    DifficultyDataInvalid,
+    InvalidVin,
+    InvalidVout,
+    WrongTxId,
+    SpvError,
+    NotAtCurrentOrPreviousDifficulty,
+    InsufficientDifficulty,
+    BadMerkleProof,
 }
 
 impl From<SysError> for Error {
@@ -62,68 +79,99 @@ impl From<SysError> for Error {
     }
 }
 
-pub struct BitcoinHeader {
-    /// The double-sha2 digest encoded BE.
-    pub hash: Hash256Digest,
-    /// The 80-byte raw header.
-    pub raw: RawHeader,
-    /// The height of the header
-    pub height: u32,
-    /// The double-sha2 digest of the parent encoded BE.
-    pub prevhash: Hash256Digest,
-    /// The double-sha2 merkle tree root of the block transactions encoded BE.
-    pub merkle_root: Hash256Digest,
+impl From<SPVError> for Error {
+    fn from(_err: SPVError) -> Self {
+        Self::SpvError
+    }
 }
 
-pub struct SPVProof {
-    /// The 4-byte LE-encoded version number. Currently always 1 or 2.
-    pub version: RawBytes,
-    /// The transaction input vector, length-prefixed.
-    pub vin: RawBytes,
-    /// The transaction output vector, length-prefixed.
-    pub vout: RawBytes,
-    /// The 4-byte LE-encoded locktime number.
-    pub locktime: RawBytes,
-    /// The tx id
-    pub tx_id: Hash256Digest,
-    /// The transaction index
-    pub index: u32,
-    /// The confirming Bitcoin header
-    pub headers: Vec<BitcoinHeader>,
-    /// The intermediate nodes (digests between leaf and root)
-    pub intermediate_nodes: RawBytes,
-}
-
-pub struct Difficulty {
-    pub current: BigUint,
-    pub previous: BigUint,
-}
-
-fn parse_difficulty(data: &[u8]) -> Result<Difficulty, Error> {
-    todo!()
-}
-
-fn parse_witness(witness: &[u8]) -> Result<SPVProof, Error> {
-    todo!()
-}
-
-fn verify(proof: &SPVProof, difficulty: &Difficulty) -> Result<(), Error> {
-    todo!()
-}
-
-fn main() -> Result<(), Error> {
-    let witness_args = load_witness_args(0, Source::Input)?;
-    let witness = witness_args.input_type();
-    debug!("witness args is {:?}", &witness);
-
-    let proof = parse_witness(witness.as_slice())?;
-
+fn parse_difficulty() -> Result<Difficulty, Error> {
     // TODO: get this index from witness args
     let difficulty_cell_dep_index = 1;
     let dep_data = load_cell_data(difficulty_cell_dep_index, Source::CellDep)?;
     debug!("dep data is {:?}", &dep_data);
+    if DifficultyReader::verify(&dep_data, false).is_err() {
+        return Err(Error::DifficultyDataInvalid);
+    }
+    let difficulty = Difficulty::new_unchecked(dep_data.into());
+    Ok(difficulty)
+}
 
-    let difficulty = parse_difficulty(&dep_data)?;
+/// parse proof from witness
+fn parse_witness() -> Result<SPVProof, Error> {
+    let witness_args = load_witness_args(0, Source::Input)?.input_type();
+    if witness_args.is_none() {
+        return Err(Error::WitnessMissInputType);
+    }
+    let witness_args: Bytes = witness_args.to_opt().unwrap().unpack();
+    if SPVProofReader::verify(&witness_args, false).is_err() {
+        return Err(Error::WitnessInvalidEncoding);
+    }
+    let proof = SPVProof::new_unchecked(witness_args.into());
+    Ok(proof)
+}
+
+fn verify(proof: &SPVProof, difficulty: &Difficulty) -> Result<(), Error> {
+    if !btcspv::validate_vin(proof.vin().as_slice()) {
+        return Err(Error::InvalidVin);
+    }
+    if !btcspv::validate_vout(proof.vout().as_slice()) {
+        return Err(Error::InvalidVout);
+    }
+    let mut ver = [0u8; 4];
+    ver.copy_from_slice(proof.version().as_slice());
+    let mut lock = [0u8; 4];
+    lock.copy_from_slice(proof.locktime().as_slice());
+    let tx_id = validatespv::calculate_txid(
+        &ver,
+        &Vin::new(proof.vin().as_slice())?,
+        &Vout::new(proof.vout().as_slice())?,
+        &lock,
+    );
+    if tx_id.as_ref() != proof.tx_id().as_slice() {
+        return Err(Error::WrongTxId);
+    }
+
+    // verify difficulty
+    let raw_headers = proof.headers();
+    let headers = HeaderArray::new(raw_headers.as_slice())?;
+    let observed_diff = validatespv::validate_header_chain(&headers, false)?;
+    let previous_diff = BigUint::from_bytes_be(difficulty.previous().as_slice());
+    let current_diff = BigUint::from_bytes_be(difficulty.current().as_slice());
+    let first_header_diff = headers.index(0).difficulty();
+
+    let req_diff = if first_header_diff == current_diff {
+        current_diff
+    } else if first_header_diff == previous_diff {
+        previous_diff
+    } else {
+        return Err(Error::NotAtCurrentOrPreviousDifficulty);
+    };
+
+    if observed_diff < req_diff * TX_PROOF_DIFFICULTY_FACTOR {
+        return Err(Error::InsufficientDifficulty);
+    }
+
+    // verify tx
+    let header = headers.index(headers.len());
+    let mut idx = [0u8; 8];
+    idx.copy_from_slice(proof.index().as_slice());
+    if !validatespv::prove(
+        tx_id,
+        header.tx_root(),
+        &MerkleArray::new(proof.intermediate_nodes().as_slice())?,
+        u64::from_le_bytes(idx),
+    ) {
+        return Err(Error::BadMerkleProof);
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<(), Error> {
+    let proof = parse_witness()?;
+    let difficulty = parse_difficulty()?;
     verify(&proof, &difficulty)?;
+
     Ok(())
 }
